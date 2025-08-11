@@ -1,69 +1,69 @@
 #include <windows.h>
 #include <iostream>
 #include <iomanip>
-#include <thread>
-#include <atomic>
-#include <chrono>
+#include <string>
 #include <conio.h>
+#include <chrono>
 
-#define SECTION_SIZE (16 * 1024 * 1024)  // 16MB for better throughput testing
-#define READ_CHUNK_SIZE (64 * 1024)      // 64KB read chunks
+#define SECTION_SIZE (64 * 1024)  // 64KB should be enough for process info
+
+// Commands - must match kernel
+typedef enum _READER_COMMAND {
+    CMD_NONE = 0,
+    CMD_GET_SYSTEM_VERSION = 1,
+    CMD_FIND_PROCESS = 2,
+    CMD_READ_PROCESS_INFO = 3,
+    CMD_LIST_PROCESSES = 4,
+    CMD_STOP_THREAD = 99
+} READER_COMMAND;
 
 // Must match kernel structure EXACTLY
-typedef struct _SHARED_DATA {
+typedef struct _SHARED_READER_DATA {
     // Control fields
     volatile LONG MagicNumber;
-    volatile LONG StartFlag;
     volatile LONG ThreadRunning;
-    volatile LONG StopRequested;
 
-    // Speed test fields
-    volatile LONG WriteIndex;
-    volatile LONG ReadIndex;
-    volatile LONG64 BytesWritten;
-    volatile LONG64 BytesRead;
+    // Command interface
+    volatile LONG Command;
+    volatile LONG CommandReady;
+    volatile LONG ResponseReady;
+    volatile LONG ProcessingCommand;
+
+    // Command parameters
+    CHAR TargetProcessName[256];
+    ULONG TargetPid;
+
+    // Response fields
+    volatile LONG ResponseStatus;
+    volatile LONG ResponseLength;
 
     // Statistics
-    LARGE_INTEGER StartTime;
-    LARGE_INTEGER LastUpdateTime;
-    volatile LONG BufferSize;
+    LARGE_INTEGER LastCommandTime;
+    volatile LONG CommandsProcessed;
 
-    // Padding for alignment
-    ULONG Reserved[8];
-} SHARED_DATA, * PSHARED_DATA;
+    // Response buffer
+    CHAR ResponseBuffer[4096];
 
-class SpeedTest {
+} SHARED_READER_DATA, * PSHARED_READER_DATA;
+
+class ProcessReaderClient {
 private:
     HANDLE hSection;
     PVOID pBase;
-    PSHARED_DATA pControl;
-    PUCHAR pBuffer;
-    std::atomic<bool> readerRunning;
-    std::thread readerThread;
-    std::thread statsThread;
-
-    // Verify data pattern
-    bool VerifyPattern(PUCHAR buffer, ULONG size, ULONG seed) {
-        for (ULONG i = 0; i < size; i++) {
-            if (buffer[i] != (UCHAR)((seed + i) & 0xFF)) {
-                return false;
-            }
-        }
-        return true;
-    }
+    PSHARED_READER_DATA pShared;
+    bool connected;
 
 public:
-    SpeedTest() : hSection(nullptr), pBase(nullptr), pControl(nullptr),
-        pBuffer(nullptr), readerRunning(false) {
+    ProcessReaderClient() : hSection(nullptr), pBase(nullptr),
+        pShared(nullptr), connected(false) {
     }
 
-    ~SpeedTest() {
+    ~ProcessReaderClient() {
         Cleanup();
     }
 
     bool Initialize() {
-        std::cout << "[+] Creating shared memory section ("
-            << (SECTION_SIZE / (1024 * 1024)) << " MB)..." << std::endl;
+        std::cout << "[+] Creating shared memory section..." << std::endl;
 
         // Create file mapping
         hSection = CreateFileMappingW(
@@ -72,7 +72,7 @@ public:
             PAGE_READWRITE,
             0,
             SECTION_SIZE,
-            L"Global\\MySharedSection"
+            L"Global\\ProcessReaderSection"
         );
 
         if (!hSection) {
@@ -105,25 +105,18 @@ public:
 
         std::cout << "[+] Mapped at: 0x" << std::hex << pBase << std::dec << std::endl;
 
-        // Initialize pointers
-        pControl = (PSHARED_DATA)pBase;
-        pBuffer = (PUCHAR)pBase + sizeof(SHARED_DATA);
+        // Initialize shared structure
+        pShared = (PSHARED_READER_DATA)pBase;
+        memset(pShared, 0, sizeof(SHARED_READER_DATA));
+        pShared->MagicNumber = 0xDEADBEEF;
+        pShared->ThreadRunning = 0;
+        pShared->Command = CMD_NONE;
+        pShared->CommandReady = 0;
+        pShared->ResponseReady = 0;
+        pShared->ProcessingCommand = 0;
+        pShared->CommandsProcessed = 0;
 
-        // Initialize control structure
-        memset(pControl, 0, sizeof(SHARED_DATA));
-        pControl->MagicNumber = 0xAABBCCDD;
-        pControl->StartFlag = 0;
-        pControl->ThreadRunning = 0;
-        pControl->StopRequested = 0;
-        pControl->WriteIndex = 0;
-        pControl->ReadIndex = 0;
-        pControl->BytesWritten = 0;
-        pControl->BytesRead = 0;
-        pControl->BufferSize = SECTION_SIZE - sizeof(SHARED_DATA);
-
-        std::cout << "[+] Initialized with buffer size: "
-            << (pControl->BufferSize / (1024 * 1024)) << " MB" << std::endl;
-
+        std::cout << "[+] Shared memory initialized" << std::endl;
         return true;
     }
 
@@ -133,22 +126,24 @@ public:
         _getch();
 
         // Check if kernel modified the magic
-        if (pControl->MagicNumber == 0x12345678) {
+        if (pShared->MagicNumber == 0xCAFEBABE) {
             std::cout << "[+] Kernel connected successfully!" << std::endl;
+            connected = true;
         }
         else {
             std::cout << "[!] Kernel may not have connected properly" << std::endl;
+            std::cout << "[!] Magic: 0x" << std::hex << pShared->MagicNumber << std::dec << std::endl;
         }
 
         // Check if kernel thread is running
-        if (pControl->ThreadRunning) {
+        if (pShared->ThreadRunning) {
             std::cout << "[+] Kernel thread is running!" << std::endl;
         }
         else {
             std::cout << "[!] Waiting for kernel thread..." << std::endl;
             for (int i = 0; i < 30; i++) {
                 Sleep(100);
-                if (pControl->ThreadRunning) {
+                if (pShared->ThreadRunning) {
                     std::cout << "[+] Kernel thread detected!" << std::endl;
                     break;
                 }
@@ -156,56 +151,134 @@ public:
         }
     }
 
-    void StartTest() {
-        std::cout << "\n[+] Starting speed test..." << std::endl;
-
-        // Reset counters
-        pControl->BytesWritten = 0;
-        pControl->BytesRead = 0;
-        pControl->WriteIndex = 0;
-        pControl->ReadIndex = 0;
-        QueryPerformanceCounter(&pControl->StartTime);
-
-        // Start reader thread
-        readerRunning = true;
-        readerThread = std::thread(&SpeedTest::ReaderThreadFunc, this);
-
-        // Start stats thread
-        statsThread = std::thread(&SpeedTest::StatsThreadFunc, this);
-
-        // Signal kernel to start
-        InterlockedExchange(&pControl->StartFlag, 1);
-        std::cout << "[+] Test started! Press SPACE to stop..." << std::endl;
-    }
-
-    void StopTest() {
-        std::cout << "\n[+] Stopping test..." << std::endl;
-
-        // Stop kernel writing
-        InterlockedExchange(&pControl->StartFlag, 0);
-
-        // Stop reader thread
-        readerRunning = false;
-        if (readerThread.joinable()) {
-            readerThread.join();
-        }
-        if (statsThread.joinable()) {
-            statsThread.join();
+    bool SendCommand(READER_COMMAND cmd, const char* processName = nullptr, ULONG pid = 0) {
+        if (!connected) {
+            std::cout << "[-] Not connected to kernel driver!" << std::endl;
+            return false;
         }
 
-        // Print final stats
-        PrintFinalStats();
+        // Wait if previous command is still processing
+        int waitCount = 0;
+        while (pShared->ProcessingCommand && waitCount < 50) {
+            Sleep(100);
+            waitCount++;
+        }
+
+        if (pShared->ProcessingCommand) {
+            std::cout << "[-] Previous command still processing!" << std::endl;
+            return false;
+        }
+
+        // Set command parameters
+        pShared->Command = cmd;
+
+        if (processName) {
+            strncpy_s(pShared->TargetProcessName, sizeof(pShared->TargetProcessName),
+                processName, _TRUNCATE);
+        }
+
+        if (pid > 0) {
+            pShared->TargetPid = pid;
+        }
+
+        // Clear previous response
+        pShared->ResponseReady = 0;
+        pShared->ResponseLength = 0;
+
+        // Signal command ready
+        InterlockedExchange(&pShared->CommandReady, 1);
+
+        std::cout << "[*] Command sent, waiting for response..." << std::endl;
+
+        // Wait for response
+        auto startTime = std::chrono::steady_clock::now();
+        while (!pShared->ResponseReady) {
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - startTime).count();
+
+            if (elapsed > 5) {
+                std::cout << "[-] Timeout waiting for response!" << std::endl;
+                return false;
+            }
+
+            Sleep(50);
+        }
+
+        // Display response
+        if (pShared->ResponseStatus == 0) { // STATUS_SUCCESS
+            std::cout << "[+] Response received (Status: SUCCESS, Length: "
+                << pShared->ResponseLength << " bytes)" << std::endl;
+        }
+        else {
+            std::cout << "[!] Response received (Status: 0x" << std::hex
+                << pShared->ResponseStatus << std::dec
+                << ", Length: " << pShared->ResponseLength << " bytes)" << std::endl;
+        }
+
+        if (pShared->ResponseLength > 0) {
+            std::cout << "\n===== RESPONSE DATA =====\n" << std::endl;
+            std::cout << pShared->ResponseBuffer << std::endl;
+            std::cout << "\n========================\n" << std::endl;
+        }
+
+        return true;
     }
 
-    void RequestDriverStop() {
-        std::cout << "\n[+] Requesting kernel thread to stop..." << std::endl;
-        InterlockedExchange(&pControl->StopRequested, 1);
+    void GetSystemVersion() {
+        std::cout << "\n[*] Getting system version..." << std::endl;
+        SendCommand(CMD_GET_SYSTEM_VERSION);
+    }
+
+    void FindProcess() {
+        std::string processName;
+        std::cout << "\n[*] Enter process name to find (e.g., notepad.exe): ";
+        std::getline(std::cin, processName);
+
+        if (!processName.empty()) {
+            std::cout << "[*] Searching for: " << processName << std::endl;
+            SendCommand(CMD_FIND_PROCESS, processName.c_str());
+        }
+    }
+
+    void GetProcessInfo() {
+        ULONG pid;
+        std::cout << "\n[*] Enter PID to get info: ";
+        std::cin >> pid;
+        std::cin.ignore(); // Clear the newline
+
+        if (pid > 0) {
+            std::cout << "[*] Getting info for PID: " << pid << std::endl;
+            SendCommand(CMD_READ_PROCESS_INFO, nullptr, pid);
+        }
+    }
+
+    void ListProcesses() {
+        std::cout << "\n[*] Listing running processes..." << std::endl;
+        SendCommand(CMD_LIST_PROCESSES);
+    }
+
+    void ShowStatistics() {
+        if (!connected) {
+            std::cout << "[-] Not connected!" << std::endl;
+            return;
+        }
+
+        std::cout << "\n===== STATISTICS =====" << std::endl;
+        std::cout << "Commands Processed: " << pShared->CommandsProcessed << std::endl;
+        std::cout << "Thread Running: " << (pShared->ThreadRunning ? "Yes" : "No") << std::endl;
+        std::cout << "======================" << std::endl;
+    }
+
+    void StopKernelThread() {
+        std::cout << "\n[*] Sending stop command to kernel thread..." << std::endl;
+        SendCommand(CMD_STOP_THREAD);
 
         // Wait for thread to stop
-        for (int i = 0; i < 50; i++) {
+        for (int i = 0; i < 30; i++) {
             Sleep(100);
-            if (!pControl->ThreadRunning) {
+            if (!pShared->ThreadRunning) {
                 std::cout << "[+] Kernel thread stopped successfully!" << std::endl;
+                connected = false;
                 return;
             }
         }
@@ -216,226 +289,104 @@ public:
         if (pBase) {
             UnmapViewOfFile(pBase);
             pBase = nullptr;
-            pControl = nullptr;
-            pBuffer = nullptr;
+            pShared = nullptr;
         }
         if (hSection) {
             CloseHandle(hSection);
             hSection = nullptr;
         }
+        connected = false;
     }
 
-private:
-    void ReaderThreadFunc() {
-        PUCHAR readBuffer = new UCHAR[READ_CHUNK_SIZE];
-        ULONG bufferSize = pControl->BufferSize;
-        bool verifyData = false;  // Set to true to verify data integrity (slower)
-
-        while (readerRunning) {
-            LONG writeIdx = pControl->WriteIndex;
-            LONG readIdx = pControl->ReadIndex;
-
-            // Calculate available data
-            LONG availableData;
-            if (writeIdx >= readIdx) {
-                availableData = writeIdx - readIdx;
-            }
-            else {
-                availableData = bufferSize - readIdx + writeIdx;
-            }
-
-            if (availableData > 0) {
-                // Read up to READ_CHUNK_SIZE bytes
-                ULONG readSize = min(availableData, READ_CHUNK_SIZE);
-
-                // Handle circular buffer wrap-around
-                if (readIdx + readSize > bufferSize) {
-                    // Read in two parts
-                    ULONG firstPart = bufferSize - readIdx;
-                    ULONG secondPart = readSize - firstPart;
-
-                    // Copy first part
-                    memcpy(readBuffer, pBuffer + readIdx, firstPart);
-
-                    // Copy second part
-                    if (secondPart > 0) {
-                        memcpy(readBuffer + firstPart, pBuffer, secondPart);
-                    }
-
-                    // Update read index
-                    InterlockedExchange(&pControl->ReadIndex, secondPart);
-                }
-                else {
-                    // Simple read without wrap-around
-                    memcpy(readBuffer, pBuffer + readIdx, readSize);
-
-                    // Update read index
-                    LONG newReadIdx = readIdx + readSize;
-                    if (newReadIdx >= bufferSize) {
-                        newReadIdx = 0;
-                    }
-                    InterlockedExchange(&pControl->ReadIndex, newReadIdx);
-                }
-
-                // Update bytes read counter
-                InterlockedAdd64(&pControl->BytesRead, readSize);
-
-                // Optional: Verify data integrity
-                if (verifyData && readSize >= 256) {
-                    // Check first 256 bytes of pattern
-                    bool valid = true;
-                    for (int i = 1; i < 256; i++) {
-                        if (readBuffer[i] != (UCHAR)((readBuffer[0] + i) & 0xFF)) {
-                            valid = false;
-                            break;
-                        }
-                    }
-                    if (!valid) {
-                        std::cout << "\n[!] Data verification failed!" << std::endl;
-                    }
-                }
-
-            }
-            else {
-                // No data available, yield
-                Sleep(0);
-            }
-        }
-
-        delete[] readBuffer;
-    }
-
-    void StatsThreadFunc() {
-        auto lastPrintTime = std::chrono::steady_clock::now();
-        LONG64 lastBytesWritten = 0;
-        LONG64 lastBytesRead = 0;
-
-        while (readerRunning) {
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                now - lastPrintTime).count();
-
-            if (elapsed >= 1000) {  // Print stats every second
-                LONG64 currentBytesWritten = pControl->BytesWritten;
-                LONG64 currentBytesRead = pControl->BytesRead;
-
-                double writeMBps = ((currentBytesWritten - lastBytesWritten) / 1024.0 / 1024.0)
-                    * (1000.0 / elapsed);
-                double readMBps = ((currentBytesRead - lastBytesRead) / 1024.0 / 1024.0)
-                    * (1000.0 / elapsed);
-
-                // Calculate buffer usage
-                LONG writeIdx = pControl->WriteIndex;
-                LONG readIdx = pControl->ReadIndex;
-                LONG bufferUsed;
-                if (writeIdx >= readIdx) {
-                    bufferUsed = writeIdx - readIdx;
-                }
-                else {
-                    bufferUsed = pControl->BufferSize - readIdx + writeIdx;
-                }
-                double bufferUsage = (bufferUsed * 100.0) / pControl->BufferSize;
-
-                std::cout << "\r[STATS] Write: " << std::fixed << std::setprecision(2)
-                    << writeMBps << " MB/s | Read: " << readMBps
-                    << " MB/s | Buffer: " << std::setprecision(1)
-                    << bufferUsage << "% | Total: "
-                    << (currentBytesWritten / (1024 * 1024)) << " MB written, "
-                    << (currentBytesRead / (1024 * 1024)) << " MB read        ";
-
-                lastBytesWritten = currentBytesWritten;
-                lastBytesRead = currentBytesRead;
-                lastPrintTime = now;
-            }
-
-            Sleep(100);
-        }
-    }
-
-    void PrintFinalStats() {
-        std::cout << "\n\n========== FINAL STATISTICS ==========" << std::endl;
-
-        LARGE_INTEGER endTime, freq;
-        QueryPerformanceCounter(&endTime);
-        QueryPerformanceFrequency(&freq);
-
-        double elapsedSeconds = (endTime.QuadPart - pControl->StartTime.QuadPart)
-            / (double)freq.QuadPart;
-
-        LONG64 totalWritten = pControl->BytesWritten;
-        LONG64 totalRead = pControl->BytesRead;
-
-        double avgWriteMBps = (totalWritten / 1024.0 / 1024.0) / elapsedSeconds;
-        double avgReadMBps = (totalRead / 1024.0 / 1024.0) / elapsedSeconds;
-
-        std::cout << "Test Duration: " << std::fixed << std::setprecision(2)
-            << elapsedSeconds << " seconds" << std::endl;
-        std::cout << "Total Written: " << (totalWritten / (1024 * 1024)) << " MB" << std::endl;
-        std::cout << "Total Read: " << (totalRead / (1024 * 1024)) << " MB" << std::endl;
-        std::cout << "Average Write Speed: " << avgWriteMBps << " MB/s" << std::endl;
-        std::cout << "Average Read Speed: " << avgReadMBps << " MB/s" << std::endl;
-        std::cout << "======================================" << std::endl;
-    }
+    bool IsConnected() const { return connected; }
 };
 
-int main() {
-    std::cout << "========== Full Kernel-to-Usermode Speed Test ==========" << std::endl;
-    std::cout << "[*] This test measures actual data transfer speed via shared memory" << std::endl;
+void ShowMenu() {
+    std::cout << "\n========== PROCESS READER MENU ==========" << std::endl;
+    std::cout << "1. Get System Version" << std::endl;
+    std::cout << "2. Find Process by Name" << std::endl;
+    std::cout << "3. Get Process Info by PID" << std::endl;
+    std::cout << "4. List Running Processes" << std::endl;
+    std::cout << "5. Show Statistics" << std::endl;
+    std::cout << "S. Stop Kernel Thread" << std::endl;
+    std::cout << "Q. Quit" << std::endl;
+    std::cout << "==========================================" << std::endl;
+    std::cout << "Enter choice: ";
+}
 
-    SpeedTest test;
+int main() {
+    std::cout << "========== Kernel Process Reader Client ==========" << std::endl;
+    std::cout << "[*] This tool communicates with the kernel driver via shared memory" << std::endl;
+
+    ProcessReaderClient client;
 
     // Initialize shared memory
-    if (!test.Initialize()) {
+    if (!client.Initialize()) {
         std::cout << "[-] Failed to initialize. Run as Administrator!" << std::endl;
         system("pause");
         return 1;
     }
 
     // Wait for driver
-    test.WaitForDriver();
+    client.WaitForDriver();
 
-    // Main loop
+    if (!client.IsConnected()) {
+        std::cout << "[-] Failed to connect to kernel driver!" << std::endl;
+        std::cout << "[*] Make sure the driver is loaded with KDMapper" << std::endl;
+        system("pause");
+        return 1;
+    }
+
+    // Main menu loop
     bool running = true;
-    bool testRunning = false;
-
-    std::cout << "\n[*] Commands:" << std::endl;
-    std::cout << "    SPACE - Start/Stop speed test" << std::endl;
-    std::cout << "    K     - Kill kernel thread (stop driver completely)" << std::endl;
-    std::cout << "    Q     - Quit" << std::endl;
-    std::cout << "\nPress SPACE to start the test..." << std::endl;
-
     while (running) {
-        if (_kbhit()) {
-            char key = _getch();
+        ShowMenu();
 
-            if (key == ' ') {
-                if (!testRunning) {
-                    test.StartTest();
-                    testRunning = true;
-                }
-                else {
-                    test.StopTest();
-                    testRunning = false;
-                }
-            }
-            else if (key == 'k' || key == 'K') {
-                if (testRunning) {
-                    test.StopTest();
-                    testRunning = false;
-                }
-                test.RequestDriverStop();
-                std::cout << "[*] Kernel thread stop requested." << std::endl;
-                std::cout << "[*] You can now safely unload or reload the driver." << std::endl;
-            }
-            else if (key == 'q' || key == 'Q') {
-                if (testRunning) {
-                    test.StopTest();
-                    testRunning = false;
-                }
-                running = false;
-            }
+        char choice;
+        std::cin >> choice;
+        std::cin.ignore(); // Clear the newline
+
+        switch (choice) {
+        case '1':
+            client.GetSystemVersion();
+            break;
+
+        case '2':
+            client.FindProcess();
+            break;
+
+        case '3':
+            client.GetProcessInfo();
+            break;
+
+        case '4':
+            client.ListProcesses();
+            break;
+
+        case '5':
+            client.ShowStatistics();
+            break;
+
+        case 's':
+        case 'S':
+            client.StopKernelThread();
+            std::cout << "[*] You can now safely unload the driver" << std::endl;
+            break;
+
+        case 'q':
+        case 'Q':
+            running = false;
+            break;
+
+        default:
+            std::cout << "[!] Invalid choice!" << std::endl;
+            break;
         }
-        Sleep(50);
+
+        if (running && choice != '5') {
+            std::cout << "\nPress any key to continue..." << std::endl;
+            _getch();
+        }
     }
 
     std::cout << "\n[+] Exiting..." << std::endl;
