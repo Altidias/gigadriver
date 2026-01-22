@@ -7,7 +7,6 @@
 
 #define SECTION_SIZE (64 * 1024)  // 64KB should be enough for process info
 
-// Commands - must match kernel
 typedef enum _READER_COMMAND {
     CMD_NONE = 0,
     CMD_GET_SYSTEM_VERSION = 1,
@@ -17,31 +16,24 @@ typedef enum _READER_COMMAND {
     CMD_STOP_THREAD = 99
 } READER_COMMAND;
 
-// Must match kernel structure EXACTLY
 typedef struct _SHARED_READER_DATA {
-    // Control fields
     volatile LONG MagicNumber;
     volatile LONG ThreadRunning;
 
-    // Command interface
     volatile LONG Command;
     volatile LONG CommandReady;
     volatile LONG ResponseReady;
     volatile LONG ProcessingCommand;
 
-    // Command parameters
     CHAR TargetProcessName[256];
     ULONG TargetPid;
 
-    // Response fields
     volatile LONG ResponseStatus;
     volatile LONG ResponseLength;
 
-    // Statistics
     LARGE_INTEGER LastCommandTime;
     volatile LONG CommandsProcessed;
 
-    // Response buffer
     CHAR ResponseBuffer[4096];
 
 } SHARED_READER_DATA, * PSHARED_READER_DATA;
@@ -65,7 +57,6 @@ public:
     bool Initialize() {
         std::cout << "[+] Creating shared memory section..." << std::endl;
 
-        // Create file mapping
         hSection = CreateFileMappingW(
             INVALID_HANDLE_VALUE,
             NULL,
@@ -88,7 +79,6 @@ public:
             std::cout << "[+] Section created successfully" << std::endl;
         }
 
-        // Map view
         pBase = MapViewOfFile(
             hSection,
             FILE_MAP_ALL_ACCESS,
@@ -105,7 +95,6 @@ public:
 
         std::cout << "[+] Mapped at: 0x" << std::hex << pBase << std::dec << std::endl;
 
-        // Initialize shared structure
         pShared = (PSHARED_READER_DATA)pBase;
         memset(pShared, 0, sizeof(SHARED_READER_DATA));
         pShared->MagicNumber = 0xDEADBEEF;
@@ -125,7 +114,6 @@ public:
         std::cout << "[*] Press any key after driver is loaded..." << std::endl;
         _getch();
 
-        // Check if kernel modified the magic
         if (pShared->MagicNumber == 0xCAFEBABE) {
             std::cout << "[+] Kernel connected successfully!" << std::endl;
             connected = true;
@@ -135,7 +123,6 @@ public:
             std::cout << "[!] Magic: 0x" << std::hex << pShared->MagicNumber << std::dec << std::endl;
         }
 
-        // Check if kernel thread is running
         if (pShared->ThreadRunning) {
             std::cout << "[+] Kernel thread is running!" << std::endl;
         }
@@ -156,8 +143,6 @@ public:
             std::cout << "[-] Not connected to kernel driver!" << std::endl;
             return false;
         }
-
-        // Wait if previous command is still processing
         int waitCount = 0;
         while (pShared->ProcessingCommand && waitCount < 50) {
             Sleep(100);
@@ -168,8 +153,6 @@ public:
             std::cout << "[-] Previous command still processing!" << std::endl;
             return false;
         }
-
-        // Set command parameters
         pShared->Command = cmd;
 
         if (processName) {
@@ -181,16 +164,14 @@ public:
             pShared->TargetPid = pid;
         }
 
-        // Clear previous response
         pShared->ResponseReady = 0;
         pShared->ResponseLength = 0;
 
-        // Signal command ready
         InterlockedExchange(&pShared->CommandReady, 1);
 
         std::cout << "[*] Command sent, waiting for response..." << std::endl;
 
-        // Wait for response
+
         auto startTime = std::chrono::steady_clock::now();
         while (!pShared->ResponseReady) {
             auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
@@ -204,7 +185,7 @@ public:
             Sleep(50);
         }
 
-        // Display response
+
         if (pShared->ResponseStatus == 0) { // STATUS_SUCCESS
             std::cout << "[+] Response received (Status: SUCCESS, Length: "
                 << pShared->ResponseLength << " bytes)" << std::endl;
@@ -244,7 +225,7 @@ public:
         ULONG pid;
         std::cout << "\n[*] Enter PID to get info: ";
         std::cin >> pid;
-        std::cin.ignore(); // Clear the newline
+        std::cin.ignore();
 
         if (pid > 0) {
             std::cout << "[*] Getting info for PID: " << pid << std::endl;
@@ -273,7 +254,6 @@ public:
         std::cout << "\n[*] Sending stop command to kernel thread..." << std::endl;
         SendCommand(CMD_STOP_THREAD);
 
-        // Wait for thread to stop
         for (int i = 0; i < 30; i++) {
             Sleep(100);
             if (!pShared->ThreadRunning) {
@@ -320,14 +300,12 @@ int main() {
 
     ProcessReaderClient client;
 
-    // Initialize shared memory
     if (!client.Initialize()) {
         std::cout << "[-] Failed to initialize. Run as Administrator!" << std::endl;
         system("pause");
         return 1;
     }
 
-    // Wait for driver
     client.WaitForDriver();
 
     if (!client.IsConnected()) {
@@ -337,14 +315,13 @@ int main() {
         return 1;
     }
 
-    // Main menu loop
     bool running = true;
     while (running) {
         ShowMenu();
 
         char choice;
         std::cin >> choice;
-        std::cin.ignore(); // Clear the newline
+        std::cin.ignore(); 
 
         switch (choice) {
         case '1':
