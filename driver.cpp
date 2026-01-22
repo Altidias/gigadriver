@@ -4,7 +4,6 @@ extern "C" {
 #include <ntstrsafe.h>
 }
 
-// Compatibility layer for different WDK versions
 #ifdef POOL_FLAG_NON_PAGED
 #define ALLOCATE_NONPAGED_POOL(size, tag) \
         ExAllocatePool2(POOL_FLAG_NON_PAGED, size, tag)
@@ -21,14 +20,12 @@ extern "C" {
 #define SHARED_SECTION_NAME L"\\BaseNamedObjects\\ProcessReaderSection"
 #define MAX_RESPONSE_SIZE (4 * 1024)  // 4KB for response data
 
-// Process offsets
 #ifdef _WIN64
 #define EPROCESS_IMAGEFILENAME_OFFSET 0x5A8
 #else
 #define EPROCESS_IMAGEFILENAME_OFFSET 0x2E0
 #endif
 
-// Commands from usermode
 typedef enum _READER_COMMAND {
     CMD_NONE = 0,
     CMD_GET_SYSTEM_VERSION = 1,
@@ -38,36 +35,28 @@ typedef enum _READER_COMMAND {
     CMD_STOP_THREAD = 99
 } READER_COMMAND;
 
-// Shared memory structure
 typedef struct _SHARED_READER_DATA {
-    // Control fields
     volatile LONG MagicNumber;       // 0xDEADBEEF from usermode, 0xCAFEBABE from kernel
     volatile LONG ThreadRunning;     // 1 = kernel thread is running
 
-    // Command interface
     volatile LONG Command;           // Command from usermode (READER_COMMAND)
     volatile LONG CommandReady;      // 1 = command ready for processing
     volatile LONG ResponseReady;     // 1 = response ready for reading
     volatile LONG ProcessingCommand; // 1 = kernel is processing command
 
-    // Command parameters
     CHAR TargetProcessName[256];    // For CMD_FIND_PROCESS
-    ULONG TargetPid;                // For CMD_READ_PROCESS_INFO
+    ULONG TargetPid; // For CMD_READ_PROCESS_INFO
 
-    // Response fields
     volatile LONG ResponseStatus;    // NTSTATUS of operation
     volatile LONG ResponseLength;    // Length of response data
 
-    // Statistics
     LARGE_INTEGER LastCommandTime;
     volatile LONG CommandsProcessed;
 
-    // Response buffer (variable length data)
     CHAR ResponseBuffer[MAX_RESPONSE_SIZE];
 
 } SHARED_READER_DATA, * PSHARED_READER_DATA;
 
-// Process info structure for response
 typedef struct _PROCESS_INFO {
     ULONG ProcessId;
     CHAR ProcessName[256];
@@ -75,7 +64,6 @@ typedef struct _PROCESS_INFO {
     CHAR AdditionalInfo[512];
 } PROCESS_INFO, * PPROCESS_INFO;
 
-// Globals
 HANDLE g_SectionHandle = nullptr;
 PVOID g_SectionObject = nullptr;
 PVOID g_SystemMapping = nullptr;
@@ -83,7 +71,6 @@ SIZE_T g_MappedSize = 0;
 HANDLE g_ThreadHandle = nullptr;
 volatile LONG g_ThreadShouldExit = 0;
 
-// Safe function to get process name
 PCHAR GetProcessName(PEPROCESS Process) {
     __try {
         typedef PCHAR(*PsGetProcessImageFileNameFunc)(PEPROCESS);
@@ -104,7 +91,6 @@ PCHAR GetProcessName(PEPROCESS Process) {
     }
 }
 
-// Get Windows version from SharedUserData
 NTSTATUS GetWindowsVersion(PCHAR outputBuffer, SIZE_T bufferSize) {
     typedef struct _MY_KUSER_SHARED_DATA {
         ULONG TickCountLowDeprecated;
@@ -160,12 +146,10 @@ NTSTATUS GetWindowsVersion(PCHAR outputBuffer, SIZE_T bufferSize) {
     return STATUS_UNSUCCESSFUL;
 }
 
-// Find process by name and get info
 NTSTATUS FindProcessByName(const char* targetName, PPROCESS_INFO pInfo) {
     for (ULONG pid = 4; pid < 65536; pid += 4) {
         PEPROCESS process = NULL;
 
-        // Skip PID 0 (System Idle Process) - PsLookupProcessByProcessId doesn't accept it
         if (pid == 0) continue;
 
         NTSTATUS status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &process);
@@ -195,13 +179,11 @@ NTSTATUS FindProcessByName(const char* targetName, PPROCESS_INFO pInfo) {
     return STATUS_NOT_FOUND;
 }
 
-// List all running processes
 NTSTATUS ListProcesses(PSHARED_READER_DATA pShared) {
     ULONG count = 0;
     PCHAR pBuffer = pShared->ResponseBuffer;
     SIZE_T bufferRemaining = MAX_RESPONSE_SIZE;
 
-    // Header
     NTSTATUS status = RtlStringCbPrintfExA(
         pBuffer, bufferRemaining,
         &pBuffer, &bufferRemaining,
@@ -211,9 +193,7 @@ NTSTATUS ListProcesses(PSHARED_READER_DATA pShared) {
 
     if (!NT_SUCCESS(status)) return status;
 
-    // Enumerate processes
     for (ULONG pid = 4; pid < 65536 && bufferRemaining > 100; pid += 4) {
-        // Skip PID 0 - PsLookupProcessByProcessId doesn't accept it
         if (pid == 0) continue;
 
         PEPROCESS process = NULL;
@@ -239,7 +219,6 @@ NTSTATUS ListProcesses(PSHARED_READER_DATA pShared) {
             ObDereferenceObject(process);
         }
 
-        // Limit output
         if (count >= 50) {
             RtlStringCbPrintfExA(
                 pBuffer, bufferRemaining,
@@ -251,7 +230,6 @@ NTSTATUS ListProcesses(PSHARED_READER_DATA pShared) {
         }
     }
 
-    // Footer
     RtlStringCbPrintfExA(
         pBuffer, bufferRemaining,
         &pBuffer, &bufferRemaining,
@@ -264,7 +242,6 @@ NTSTATUS ListProcesses(PSHARED_READER_DATA pShared) {
     return STATUS_SUCCESS;
 }
 
-// Process command from usermode
 NTSTATUS ProcessCommand(PSHARED_READER_DATA pShared) {
     NTSTATUS status = STATUS_SUCCESS;
     READER_COMMAND cmd = (READER_COMMAND)pShared->Command;
@@ -272,7 +249,6 @@ NTSTATUS ProcessCommand(PSHARED_READER_DATA pShared) {
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
         "[READER] Processing command: %d\n", cmd);
 
-    // Clear response buffer
     RtlZeroMemory(pShared->ResponseBuffer, MAX_RESPONSE_SIZE);
     pShared->ResponseLength = 0;
 
@@ -359,7 +335,6 @@ NTSTATUS ProcessCommand(PSHARED_READER_DATA pShared) {
     return status;
 }
 
-// Worker thread
 VOID ReaderWorkerThread(PVOID Context) {
     UNREFERENCED_PARAMETER(Context);
 
@@ -375,7 +350,6 @@ VOID ReaderWorkerThread(PVOID Context) {
 
     PSHARED_READER_DATA pShared = (PSHARED_READER_DATA)g_SystemMapping;
 
-    // Verify magic number
     if (pShared->MagicNumber != 0xDEADBEEF) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
             "[READER] ERROR: Invalid magic number 0x%X!\n", pShared->MagicNumber);
@@ -383,38 +357,30 @@ VOID ReaderWorkerThread(PVOID Context) {
         return;
     }
 
-    // Update magic and set running flag
     pShared->MagicNumber = 0xCAFEBABE;
     InterlockedExchange(&pShared->ThreadRunning, 1);
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
         "[READER] Thread ready for commands\n");
 
-    // Main loop
     while (InterlockedCompareExchange(&g_ThreadShouldExit, 0, 0) == 0) {
 
-        // Check for stop command
         if (pShared->Command == CMD_STOP_THREAD) {
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                 "[READER] Stop command received\n");
             break;
         }
 
-        // Check if command is ready
         if (InterlockedCompareExchange(&pShared->CommandReady, 0, 1) == 1) {
-            // Mark as processing
             InterlockedExchange(&pShared->ProcessingCommand, 1);
             InterlockedExchange(&pShared->ResponseReady, 0);
 
-            // Process the command
             NTSTATUS status = ProcessCommand(pShared);
             pShared->ResponseStatus = status;
 
-            // Update statistics
             KeQuerySystemTime(&pShared->LastCommandTime);
             InterlockedIncrement(&pShared->CommandsProcessed);
 
-            // Mark response as ready
             InterlockedExchange(&pShared->ProcessingCommand, 0);
             InterlockedExchange(&pShared->ResponseReady, 1);
 
@@ -423,13 +389,11 @@ VOID ReaderWorkerThread(PVOID Context) {
                 status, pShared->ResponseLength);
         }
 
-        // Small delay to prevent CPU spinning
         LARGE_INTEGER timeout;
         timeout.QuadPart = -100000; // 10ms
         KeDelayExecutionThread(KernelMode, FALSE, &timeout);
     }
 
-    // Clear running flag
     InterlockedExchange(&pShared->ThreadRunning, 0);
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
@@ -464,7 +428,6 @@ extern "C" NTSTATUS DriverEntry(
         NULL
     );
 
-    // Open the usermode-created section
     status = ZwOpenSection(
         &g_SectionHandle,
         SECTION_ALL_ACCESS,
@@ -479,7 +442,6 @@ extern "C" NTSTATUS DriverEntry(
         return STATUS_SUCCESS;
     }
 
-    // Get section object
     status = ObReferenceObjectByHandle(
         g_SectionHandle,
         SECTION_MAP_READ | SECTION_MAP_WRITE,
@@ -496,7 +458,6 @@ extern "C" NTSTATUS DriverEntry(
         return STATUS_SUCCESS;
     }
 
-    // Map in system space
     g_MappedSize = 0;
     status = MmMapViewInSystemSpace(
         g_SectionObject,
@@ -514,8 +475,7 @@ extern "C" NTSTATUS DriverEntry(
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
         "[READER] Mapped at 0x%p, size=%zu bytes\n", g_SystemMapping, g_MappedSize);
-
-    // Create worker thread
+        
     status = PsCreateSystemThread(
         &g_ThreadHandle,
         THREAD_ALL_ACCESS,
@@ -549,7 +509,6 @@ extern "C" NTSTATUS DriverEntry(
     return STATUS_SUCCESS;
 }
 
-// Entry point for KDMapper
 extern "C" NTSTATUS CustomDriverEntry(
     PDRIVER_OBJECT DriverObject,
     PUNICODE_STRING RegistryPath
